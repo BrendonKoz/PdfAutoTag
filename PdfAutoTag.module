@@ -15,7 +15,7 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 		return array(
 			'title' => 'PDF Auto-Tag',
 			'summary' => 'Queue selected PDFs for the Adobe PDF Accessibility Auto-Tag API and record the result.',
-			'version' => '0.1.0',
+			'version' => '0.1.1',
 			'author' => 'pwstaff',
 			'singular' => true,
 			'autoload' => true,
@@ -548,12 +548,39 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 			$interval = $modules->get('InputfieldSelect');
 			$interval->attr('name', 'lazyCronInterval');
 			$interval->label = $this->_('LazyCron interval');
-			$interval->description = $this->_('How long LazyCron waits between queue checks. The default is 30 minutes. LazyCron runs only after a page on the site is requested.');
+			$interval->description = $this->_('How long LazyCron waits between queue checks. The module default is 30 minutes. LazyCron runs only after a page on the site is requested.');
 			foreach(self::lazyCronIntervals() as $name => $label) {
 				$interval->addOption($name, $label);
 			}
 			$interval->attr('value', $this->lazyCronInterval());
 			$inputfields->add($interval);
+		}
+
+		if($this->credentialsInSiteConfig()) {
+			$fromConfig = $modules->get('InputfieldMarkup');
+			$fromConfig->label = $this->_('Adobe credentials');
+			$fromConfig->attr('value', '<p>' . $sanitizer->entities($this->_('The Adobe client id and client secret are set in site/config.php.')) . '</p>');
+			$fromConfig->collapsed = Inputfield::collapsedYes;
+			$inputfields->add($fromConfig);
+		} else {
+			$id = $modules->get('InputfieldText');
+			$id->attr('name', 'clientId');
+			$id->columnWidth = 50;
+			$id->label = $this->_('Adobe client id');
+			$id->description = $this->_('Used when $config->pdfAutoTagClientId is not set in site/config.php.');
+			$id->attr('value', (string) $this->clientId);
+			$id->collapsed = Inputfield::collapsedBlank;
+			$inputfields->add($id);
+
+			$secret = $modules->get('InputfieldText');
+			$secret->attr('name', 'clientSecret');
+			$secret->attr('type', 'password');
+			$secret->columnWidth = 50;
+			$secret->label = $this->_('Adobe client secret');
+			$secret->description = $this->_('Used when $config->pdfAutoTagClientSecret is not set in site/config.php. Clearing this field removes the stored secret.');
+			$secret->attr('value', (string) $this->clientSecret);
+			$secret->collapsed = Inputfield::collapsedBlank;
+			$inputfields->add($secret);
 		}
 
 		$admin = $this->pages->get('name=pdf-autotag, template=admin, include=all');
@@ -565,30 +592,9 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 			$inputfields->add($test);
 		}
 
-		if($this->credentialsInSiteConfig()) {
-			$fromConfig = $modules->get('InputfieldMarkup');
-			$fromConfig->label = $this->_('Adobe credentials');
-			$fromConfig->attr('value', '<p>' . $sanitizer->entities($this->_('The Adobe client id and client secret are set in site/config.php.')) . '</p>');
-			$inputfields->add($fromConfig);
-		} else {
-			$id = $modules->get('InputfieldText');
-			$id->attr('name', 'clientId');
-			$id->label = $this->_('Adobe client id');
-			$id->description = $this->_('Used when $config->pdfAutoTagClientId is not set in site/config.php.');
-			$id->attr('value', (string) $this->clientId);
-			$inputfields->add($id);
-
-			$secret = $modules->get('InputfieldText');
-			$secret->attr('name', 'clientSecret');
-			$secret->attr('type', 'password');
-			$secret->label = $this->_('Adobe client secret');
-			$secret->description = $this->_('Used when $config->pdfAutoTagClientSecret is not set in site/config.php. Clearing this field removes the stored secret.');
-			$secret->attr('value', (string) $this->clientSecret);
-			$inputfields->add($secret);
-		}
-
 		$targets = $modules->get('InputfieldAsmSelect');
 		$targets->attr('name', 'watchedTargets');
+		$targets->columnWidth = 50;
 		$targets->label = $this->_('Watched file fields');
 		$targets->description = $this->_('File fields are watched on their templates and inside Repeater and Repeater Matrix items. Combo entries watch that file subfield, including when the Combo is inside a repeater.');
 		foreach($this->fields as $field) {
@@ -616,6 +622,7 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 
 		$shift = $modules->get('InputfieldCheckbox');
 		$shift->attr('name', 'shiftHeadings');
+		$shift->columnWidth = 50;
 		$shift->label = $this->_('Shift headings');
 		$shift->description = $this->_('When a title is found, tag it as H1 and move other headings down one level. Applied to requested jobs. Default is off.');
 		if($this->shiftHeadings) $shift->attr('checked', 'checked');
@@ -623,6 +630,7 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 
 		$replace = $modules->get('InputfieldCheckbox');
 		$replace->attr('name', 'replaceOnComplete');
+		$replace->columnWidth = 25;
 		$replace->label = $this->_('Replace the field file when Adobe finishes');
 		$replace->description = $this->_('Off: keep the tagged PDF with the record until someone replaces the field file from the dashboard. On: after a requested job finishes, copy the current PDF aside and put the tagged PDF in the field. This does not send files to Adobe by itself.');
 		if($this->replaceOnComplete) $replace->attr('checked', 'checked');
@@ -630,6 +638,7 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 
 		$offerReport = $modules->get('InputfieldCheckbox');
 		$offerReport->attr('name', 'offerExcelReport');
+		$offerReport->columnWidth = 25;
 		$offerReport->label = $this->_('Offer the Excel report checkbox');
 		$offerReport->description = $this->_('When on, each watched PDF shows “Also generate the Excel report” after “Process with Adobe Auto-Tag” is checked. When off, that checkbox is not shown and saving the page cannot request a report.');
 		if($this->reportsOffered()) $offerReport->attr('checked', 'checked');
@@ -637,6 +646,7 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 
 		$reportDays = $modules->get('InputfieldInteger');
 		$reportDays->attr('name', 'reportRetentionDays');
+		$reportDays->columnWidth = 25;
 		$reportDays->label = $this->_('Excel report retention (days)');
 		$reportDays->description = $this->_('Global setting. 0 keeps every saved report until someone deletes it. A larger number deletes each saved report that many days after it was stored. The job row and tagged PDF stay.');
 		$reportDays->attr('min', 0);
@@ -645,6 +655,7 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 
 		$backupDays = $modules->get('InputfieldInteger');
 		$backupDays->attr('name', 'backupRetentionDays');
+		$backupDays->columnWidth = 25;
 		$backupDays->label = $this->_('Replaced-original retention (days)');
 		$backupDays->description = $this->_('Global setting. Applies to original PDFs copied aside when automatic replace is on. 0 keeps those backups until someone restores them. A larger number deletes each of those backups that many days after the replace. Dashboard replace backups are kept.');
 		$backupDays->attr('min', 0);
