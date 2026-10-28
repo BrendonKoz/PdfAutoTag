@@ -324,11 +324,11 @@ class ProcessPdfAutoTag extends Process implements Module {
 	protected function statusLabel(array $entry) {
 		$row = $entry['row'];
 		if($row && (int) $row['skipped'] === 1) return '<span title="Skipped: Already accessible"><i class="fa fa-fw fa-check-square"></i></a>';
-		if(!$row || $row['status'] === null) return '<span title="Not requested"><i class="fa fw fa-minus-square-o" title="fa-minus-square-o"></i></span>';
+		if(!$row || $row['status'] === null) return '<span title="Not requested"><i class="fa fw fa-minus-square-o"></i></span>';
 		if($row['status'] === 0) return '<span title="Requested"><i class="fa fa-fw fa-hourglass-half"></i></span>';
 		if($row['status'] === 1) return '<span title="Completed">✅</span>';
-		if($row['status'] === 2) return '<span title="Failed"><i class="fa fw fa-ban" title="fa-ban"></i></span>';
-		return '<span title="Not requested">➖</span>';
+		if($row['status'] === 2) return '<span title="Failed"><i class="fa fw fa-ban"></i></span>';
+		return '<span title="Not requested"><i class="fa fw fa-minus-square-o"></i></span>';
 	}
 
 	protected function reportLabel(array $entry) {
