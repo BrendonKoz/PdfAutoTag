@@ -1,0 +1,1638 @@
+<?php namespace ProcessWire;
+
+require_once __DIR__ . '/AdobeAutoTagClient.php';
+
+/**
+ * Opt-in Adobe PDF Accessibility Auto-Tag for watched File, Repeater, Matrix, and Combo fields.
+ *
+ * Adobe is called only after a person requests a file. Uploading, saving, or viewing a page does not.
+ */
+class PdfAutoTag extends WireData implements Module, ConfigurableModule {
+
+	const MAX_BYTES = 104857600;
+
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'PDF Auto-Tag',
+			'summary' => 'Queue selected PDFs for the Adobe PDF Accessibility Auto-Tag API and record the result.',
+			'version' => '0.1.0',
+			'author' => 'pwstaff',
+			'singular' => true,
+			'autoload' => true,
+			'requires' => 'ProcessWire>=3.0.222',
+			'installs' => array('ProcessPdfAutoTag'),
+			'icon' => 'file-pdf-o',
+		);
+	}
+
+	public function __construct() {
+		parent::__construct();
+		$this->set('watchedTargets', array());
+		$this->set('clientId', '');
+		$this->set('clientSecret', '');
+		$this->set('shiftHeadings', 0);
+		$this->set('replaceOnComplete', 0);
+		$this->set('reportRetentionDays', 0);
+		$this->set('backupRetentionDays', 0);
+		$this->set('offerExcelReport', 1);
+		$this->set('notifyEmail', 0);
+		$this->set('monthlyCallLimit', 500);
+		$this->set('lazyCronInterval', 'every30Minutes');
+	}
+
+	/**
+	 * LazyCron hook names and the labels shown in module settings.
+	 * These are the intervals LazyCron can actually schedule.
+	 *
+	 * @return array
+	 */
+	public static function lazyCronIntervals() {
+		return array(
+			'every30Seconds' => '30 seconds',
+			'everyMinute' => '1 minute',
+			'every2Minutes' => '2 minutes',
+			'every3Minutes' => '3 minutes',
+			'every4Minutes' => '4 minutes',
+			'every5Minutes' => '5 minutes',
+			'every10Minutes' => '10 minutes',
+			'every15Minutes' => '15 minutes',
+			'every30Minutes' => '30 minutes',
+			'every45Minutes' => '45 minutes',
+			'everyHour' => '1 hour',
+			'every2Hours' => '2 hours',
+			'every4Hours' => '4 hours',
+			'every6Hours' => '6 hours',
+			'every12Hours' => '12 hours',
+			'everyDay' => '1 day',
+			'every2Days' => '2 days',
+			'every4Days' => '4 days',
+			'everyWeek' => '1 week',
+			'every2Weeks' => '2 weeks',
+			'every4Weeks' => '4 weeks',
+		);
+	}
+
+	/**
+	 * Selected LazyCron interval, or 30 minutes when the saved value is not one LazyCron provides.
+	 *
+	 * @return string
+	 */
+	public function lazyCronInterval() {
+		$intervals = self::lazyCronIntervals();
+		$value = (string) $this->get('lazyCronInterval');
+		return isset($intervals[$value]) ? $value : 'every30Minutes';
+	}
+
+	public function init() {
+		$this->addHookAfter('InputfieldFile::renderItem', $this, 'hookRenderItem');
+		$this->addHookAfter('Pages::saved', $this, 'hookPageSaved');
+		$this->addHookAfter('AdminThemeFramework::getPrimaryNavArray', $this, 'hookPrimaryNav');
+		if(!$this->systemCronEnabled() && $this->modules->isInstalled('LazyCron')) {
+			$this->addHookAfter('LazyCron::' . $this->lazyCronInterval(), $this, 'onLazyCron');
+		}
+		$this->installEmailTemplate();
+		$this->installUsageTable();
+	}
+
+	public function ready() {
+		$config = $this->wire('config');
+		if(!$config->admin) return;
+		$this->clearStaleAdminNav();
+		$url = $config->urls($this->className());
+		$config->styles->add($url . 'pdf-autotag.css?v=3');
+		$config->scripts->add($url . 'pdf-autotag.js?v=2');
+	}
+
+	public function ___install() {
+		$this->installTable();
+		$this->installStorage();
+		$this->installEmailTemplate();
+		$this->installPermission();
+	}
+
+	/**
+	 * True when site/config.php sets $config->autoTagUseSystemCron to true.
+	 * LazyCron is not used in that case.
+	 *
+	 * @return bool
+	 */
+	public function systemCronEnabled() {
+		$flag = $this->wire('config')->autoTagUseSystemCron;
+		return $flag === true || $flag === 1 || $flag === '1' || $flag === 'true';
+	}
+
+	public function cronCommand() {
+		$path = str_replace('\\', '/', $this->wire('config')->paths->root . 'site/modules/PdfAutoTag/cron.php');
+		return '*/5 * * * * php ' . $path;
+	}
+
+	public function credential($which) {
+		$fromConfig = $this->configCredential($which);
+		if($fromConfig !== '') return $fromConfig;
+		return $which === 'id' ? (string) $this->clientId : (string) $this->clientSecret;
+	}
+
+	/**
+	 * Client id or secret from site/config.php, when that value is set.
+	 *
+	 * @param string $which id|secret
+	 * @return string
+	 */
+	protected function configCredential($which) {
+		$config = $this->wire('config');
+		$value = $which === 'id' ? $config->pdfAutoTagClientId : $config->pdfAutoTagClientSecret;
+		return is_string($value) ? $value : '';
+	}
+
+	/**
+	 * True when both Adobe credentials are set in site/config.php.
+	 *
+	 * @return bool
+	 */
+	protected function credentialsInSiteConfig() {
+		return $this->configCredential('id') !== '' && $this->configCredential('secret') !== '';
+	}
+
+	/**
+	 * @return string
+	 * @throws WireException
+	 */
+	public function testCredentials() {
+		$client = new AdobeAutoTagClient($this->credential('id'), $this->credential('secret'));
+		$this->wire($client);
+		$client->testCredentials();
+		return 'Adobe accepted the client credentials.';
+	}
+
+	/**
+	 * Continue requested jobs and apply retention. Does not look for new uploads.
+	 *
+	 * @return array
+	 */
+	public function executeQueue() {
+		$counts = array(
+			'locked' => false,
+			'started' => 0,
+			'finished' => 0,
+			'failed' => 0,
+			'deferred' => 0,
+			'reportsRemoved' => 0,
+			'backupsRemoved' => 0,
+		);
+		if(!$this->tableExists()) return $counts;
+		$lock = $this->lockQueue();
+		if($lock === false) {
+			$counts['locked'] = true;
+			return $counts;
+		}
+		try {
+			$this->processPending($counts);
+			$this->applyRetention($counts);
+		} catch(\Exception $e) {
+			$this->logError($e->getMessage());
+		}
+		if(is_resource($lock)) {
+			flock($lock, LOCK_UN);
+			fclose($lock);
+		}
+		return $counts;
+	}
+
+	public function onLazyCron(HookEvent $event) {
+		// Hook signature includes the event. The queue does not use it.
+		$this->executeQueue();
+	}
+
+	/**
+	 * Drop a previously rendered Setup menu that still contains the removed "PDFs" item.
+	 *
+	 * AdminThemeUikit stores that HTML in the session. Refreshing modules does not clear it.
+	 */
+	protected function clearStaleAdminNav() {
+		$session = $this->wire('session');
+		if(!$session) return;
+		$themes = array('AdminThemeUikit');
+		$configured = (string) $this->wire('config')->defaultAdminTheme;
+		if($configured !== '') $themes[] = $configured;
+		$adminTheme = $this->wire('adminTheme');
+		if($adminTheme) $themes[] = $adminTheme->className();
+		foreach(array_unique($themes) as $theme) {
+			foreach(array('prnav', 'sidenav') as $key) {
+				$html = $session->getFor($theme, $key);
+				if(!is_string($html) || strpos($html, 'pdf-autotag/./') === false) continue;
+				$session->removeFor($theme, $key);
+			}
+		}
+	}
+
+	/**
+	 * Setup shows PDF Auto-Tag directly. The old module nav item "PDFs" pointed at the same screen.
+	 *
+	 * @param HookEvent $event
+	 */
+	public function hookPrimaryNav(HookEvent $event) {
+		$items = $event->return;
+		if(!is_array($items)) return;
+		foreach($items as $i => $item) {
+			if(empty($item['children']) || !is_array($item['children'])) continue;
+			foreach($item['children'] as $j => $child) {
+				if(!isset($child['name']) || $child['name'] !== 'pdf-autotag') continue;
+				$items[$i]['children'][$j]['children'] = array();
+			}
+		}
+		$event->return = $items;
+	}
+
+	public function hookRenderItem(HookEvent $event) {
+		$page = $this->wire('page');
+		if(!$this->wire('process') instanceof ProcessPageEdit) return;
+		if(!$page || !$page->id || !$page->template || $page->template->name !== 'admin') return;
+		if(!$this->wire('user')->hasPermission('pdf-autotag')) return;
+		$inputfield = $event->object;
+		if($inputfield->get('renderValueMode')) return;
+		$pagefile = $event->arguments(0);
+		$id = (string) $event->arguments(1);
+		if(!$pagefile instanceof Pagefile) return;
+		$context = $this->watchContext($inputfield, $pagefile);
+		if(!$context) return;
+		$row = $this->findByIdentity($this->identity(
+			$context['pages_id'],
+			$context['field_id'],
+			$context['subfield'],
+			$context['filename']
+		));
+		if($row && (int) $row['skipped'] === 1) return;
+		$event->return = (string) $event->return . $this->renderChoices($id, $context, $row);
+	}
+
+	public function hookPageSaved(HookEvent $event) {
+		if(!$this->wire('process') instanceof ProcessPageEdit) return;
+		if(!$this->wire('user')->hasPermission('pdf-autotag')) return;
+		if(!$this->tableExists()) return;
+		$page = $event->arguments(0);
+		if(!$page || !$page->id) return;
+		$post = $this->wire('input')->post;
+		if(!$post || !count($post)) return;
+		$reports = array();
+		if($this->reportsOffered()) {
+			foreach($post as $key => $value) {
+				$key = (string) $key;
+				if(strpos($key, 'pdf_autotag_report_') !== 0 || !$value) continue;
+				$reports[(string) $value] = true;
+			}
+		}
+		foreach($post as $key => $value) {
+			$key = (string) $key;
+			if(strpos($key, 'pdf_autotag_report_') === 0) continue;
+			if(strpos($key, 'pdf_autotag_') !== 0 || !$value) continue;
+			$token = (string) $value;
+			$this->queueFromCheckbox($token, (int) $page->id, isset($reports[$token]));
+		}
+	}
+
+	/**
+	 * PDFs in watched fields, plus requested rows whose file is no longer in the field.
+	 *
+	 * @return array
+	 */
+	public function collectPdfs() {
+		$byIdentity = array();
+		foreach($this->allRows() as $row) {
+			$byIdentity[$row['identity']] = $row;
+		}
+		$found = array();
+		$seen = array();
+		foreach($this->targetList() as $target) {
+			if(strpos($target, 'file:') === 0) {
+				$this->collectFileField((int) substr($target, 5), $byIdentity, $found, $seen);
+			} else if(strpos($target, 'combo:') === 0) {
+				$this->collectCombo(substr($target, 6), $byIdentity, $found, $seen);
+			}
+		}
+		foreach($byIdentity as $identity => $row) {
+			if(isset($seen[$identity])) continue;
+			if($row['status'] === null && !(int) $row['skipped']) continue;
+			$found[] = array(
+				'pagefile' => null,
+				'pages_id' => (int) $row['pages_id'],
+				'owner_pages_id' => (int) $row['owner_pages_id'],
+				'field_id' => (int) $row['field_id'],
+				'container_field_id' => (int) $row['container_field_id'],
+				'subfield' => (string) $row['subfield'],
+				'filename' => (string) $row['filename'],
+				'row' => $row,
+				'missing' => true,
+			);
+		}
+		return $found;
+	}
+
+	public function locationLabel(array $entry) {
+		$parts = array();
+		$container = $this->fields->get((int) $entry['container_field_id']);
+		if($container && $container->id) $parts[] = $container->getLabel();
+		$field = $this->fields->get((int) $entry['field_id']);
+		$parts[] = ($field && $field->id) ? $field->getLabel() : ('Field #' . (int) $entry['field_id']);
+		if(!empty($entry['subfield'])) $parts[] = (string) $entry['subfield'];
+		return implode(' / ', $parts);
+	}
+
+	public function requestorName($row) {
+		if(!$row || empty($row['user_id'])) return '';
+		$user = $this->wire('users')->get((int) $row['user_id']);
+		if($user && $user->id && $user->name) return $user->name;
+		return 'User #' . (int) $row['user_id'];
+	}
+
+	public function sourceChanged(array $entry) {
+		$row = isset($entry['row']) ? $entry['row'] : null;
+		if(!$row || empty($row['file_hash']) || empty($entry['pagefile'])) return false;
+		$hash = @md5_file($entry['pagefile']->filename);
+		return $hash && !hash_equals($row['file_hash'], $hash);
+	}
+
+	public function row($id) {
+		return $this->findById((int) $id);
+	}
+
+	public function storedFile($path) {
+		if(!$path || !is_file($path)) return false;
+		$root = realpath($this->storagePath());
+		$file = realpath($path);
+		if(!$root || !$file) return false;
+		$root = rtrim(str_replace('\\', '/', $root), '/') . '/';
+		$file = str_replace('\\', '/', $file);
+		return strpos($file, $root) === 0;
+	}
+
+	/**
+	 * @param int $id
+	 * @return string Empty on success, otherwise an error message
+	 */
+	public function reprocess($id) {
+		$row = $this->findById((int) $id);
+		if(!$row) return 'That record was not found.';
+		if((int) $row['skipped'] === 1) return 'Clear the accessible mark before reprocessing.';
+		$pagefile = $this->pagefileFromRow($row);
+		if(!$pagefile) return 'The PDF is no longer in the field.';
+		$hash = @md5_file($pagefile->filename);
+		$this->updateRow((int) $row['id'], array(
+			'status' => 0,
+			'job_location' => '',
+			'error' => '',
+			'modified' => time(),
+			'user_id' => (int) $this->wire('user')->id,
+			'file_hash' => $hash ? $hash : $row['file_hash'],
+			'skipped' => 0,
+		));
+		return '';
+	}
+
+	/**
+	 * @return string
+	 */
+	public function deleteReport($id) {
+		$row = $this->findById((int) $id);
+		if(!$row) return 'That record was not found.';
+		$this->removeStored($row['report_path']);
+		$this->updateRow((int) $row['id'], array(
+			'report_path' => '',
+			'report_created' => 0,
+			'note' => 'Excel report deleted.',
+			'modified' => time(),
+		));
+		return '';
+	}
+
+	/**
+	 * @return string
+	 */
+	public function markAccessible($pagesId, $fieldId, $subfield, $filename) {
+		$parsed = array(
+			'pages_id' => (int) $pagesId,
+			'field_id' => (int) $fieldId,
+			'subfield' => (string) $subfield,
+			'filename' => basename((string) $filename),
+		);
+		if(!$this->isWatched($parsed['field_id'], $parsed['subfield'])) return 'That field is not watched.';
+		$pagefile = $this->pagefileFromParts($parsed);
+		if(!$pagefile) return 'The PDF is no longer in the field.';
+		$parsed['filename'] = $pagefile->basename;
+		$identity = $this->identity($parsed['pages_id'], $parsed['field_id'], $parsed['subfield'], $parsed['filename']);
+		$row = $this->findByIdentity($identity);
+		$now = time();
+		$hash = @md5_file($pagefile->filename);
+		list($ownerId, $containerId) = $this->ownerIds($pagefile->page);
+		if($row) {
+			$this->updateRow((int) $row['id'], array(
+				'skipped' => 1,
+				'modified' => $now,
+				'user_id' => $row['user_id'] ? $row['user_id'] : (int) $this->wire('user')->id,
+				'file_hash' => $row['file_hash'] ? $row['file_hash'] : ($hash ? $hash : ''),
+			));
+			return '';
+		}
+		$this->insertRow(array(
+			'identity' => $identity,
+			'pages_id' => $parsed['pages_id'],
+			'owner_pages_id' => $ownerId,
+			'field_id' => $parsed['field_id'],
+			'container_field_id' => $containerId,
+			'subfield' => $parsed['subfield'],
+			'filename' => $parsed['filename'],
+			'file_hash' => $hash ? $hash : '',
+			'status' => null,
+			'skipped' => 1,
+			'generate_report' => 0,
+			'created' => $now,
+			'modified' => $now,
+			'user_id' => (int) $this->wire('user')->id,
+		));
+		return '';
+	}
+
+	/**
+	 * @return string
+	 */
+	public function clearAccessible($id) {
+		$row = $this->findById((int) $id);
+		if(!$row) return 'That record was not found.';
+		$this->updateRow((int) $row['id'], array(
+			'skipped' => 0,
+			'modified' => time(),
+		));
+		return '';
+	}
+
+	/**
+	 * @param int $id
+	 * @param bool $automatic
+	 * @throws WireException
+	 */
+	public function replaceFieldFile($id, $automatic = false) {
+		$row = $this->findById((int) $id);
+		if(!$row) throw new WireException('That record was not found.');
+		if(!$this->storedFile($row['tagged_path'])) throw new WireException('The tagged PDF is not available.');
+		$pagefile = $this->pagefileFromRow($row);
+		if(!$pagefile) throw new WireException('The PDF is no longer in the field.');
+		$this->backupOriginal($row, $pagefile, $automatic);
+		if(!@copy($row['tagged_path'], $pagefile->filename)) {
+			throw new WireException('The tagged PDF could not replace the field file.');
+		}
+		$this->wire('files')->chmod($pagefile->filename);
+		clearstatcache(true, $pagefile->filename);
+		$hash = @md5_file($pagefile->filename);
+		$this->touchField($row);
+		$this->updateRow((int) $row['id'], array(
+			'file_hash' => $hash ? $hash : $row['file_hash'],
+			'modified' => time(),
+		));
+	}
+
+	/**
+	 * @param int $id
+	 * @throws WireException
+	 */
+	public function restoreOriginal($id) {
+		$row = $this->findById((int) $id);
+		if(!$row || !$this->storedFile($row['backup_path'])) {
+			throw new WireException('The original backup is no longer available.');
+		}
+		$pagefile = $this->pagefileFromRow($row);
+		if($pagefile) {
+			if(!@copy($row['backup_path'], $pagefile->filename)) {
+				throw new WireException('The original PDF could not be restored.');
+			}
+			$this->wire('files')->chmod($pagefile->filename);
+			clearstatcache(true, $pagefile->filename);
+		} else {
+			$this->addFileToField($row, $row['backup_path']);
+		}
+		$pagefile = $this->pagefileFromRow($row);
+		$hash = ($pagefile && is_file($pagefile->filename)) ? @md5_file($pagefile->filename) : '';
+		$this->touchField($row);
+		$this->updateRow((int) $row['id'], array(
+			'file_hash' => $hash ? $hash : $row['file_hash'],
+			'modified' => time(),
+			'note' => 'Original PDF restored into the field.',
+		));
+	}
+
+	public function getModuleConfigInputfields(InputfieldWrapper $inputfields) {
+		$modules = $this->wire('modules');
+		$sanitizer = $this->wire('sanitizer');
+		$cron = $sanitizer->entities($this->cronCommand());
+		$lazyInstalled = $modules->isInstalled('LazyCron');
+		if(!$lazyInstalled && !$this->systemCronEnabled()) {
+			$this->warning($this->_('LazyCron is not installed. PDF Auto-Tag does not require it. Requested jobs are not continued on their own until LazyCron is installed, or until $config->autoTagUseSystemCron is true and system cron runs the queue command.'));
+		}
+		if($this->systemCronEnabled()) {
+			$lazy = 'System cron is in use because site/config.php sets $config->autoTagUseSystemCron = true. The LazyCron hook is not used.';
+		} else if(!$lazyInstalled) {
+			$lazy = 'LazyCron is not installed. Run queue now and the system cron command below still continue requested PDFs.';
+		} else {
+			$every = self::lazyCronIntervals()[$this->lazyCronInterval()];
+			$lazy = "LazyCron is on. It runs at most every $every, during a site request, and only continues PDFs that were already requested.";
+		}
+		$notes = $modules->get('InputfieldMarkup');
+		$notes->label = $this->_('Queue schedule');
+		$notes->attr('value', '<p>' . $sanitizer->entities($lazy) . '</p>'
+			. '<p>To run the queue from system cron instead of LazyCron, add this to site/config.php:</p>'
+			. '<pre>$config->autoTagUseSystemCron = true;</pre>'
+			. '<p>Schedule this command:</p>'
+			. '<pre>' . $cron . '</pre>'
+			. '<p>The command continues requested jobs and applies report and original-file retention. It does not send a PDF to Adobe unless someone already requested it.</p>');
+		$inputfields->add($notes);
+
+		if(!$this->systemCronEnabled()) {
+			$interval = $modules->get('InputfieldSelect');
+			$interval->attr('name', 'lazyCronInterval');
+			$interval->label = $this->_('LazyCron interval');
+			$interval->description = $this->_('How long LazyCron waits between queue checks. The default is 30 minutes. LazyCron runs only after a page on the site is requested.');
+			foreach(self::lazyCronIntervals() as $name => $label) {
+				$interval->addOption($name, $label);
+			}
+			$interval->attr('value', $this->lazyCronInterval());
+			$inputfields->add($interval);
+		}
+
+		$admin = $this->pages->get('name=pdf-autotag, template=admin, include=all');
+		if($admin && $admin->id) {
+			$test = $modules->get('InputfieldMarkup');
+			$test->label = $this->_('Credentials test');
+			$test->attr('value', '<p><a class="uk-button uk-button-default" href="' . $admin->url . 'test/?return=config">Test credentials</a></p>'
+				. '<p>The test requests an Adobe access token and does not upload a PDF.</p>');
+			$inputfields->add($test);
+		}
+
+		if($this->credentialsInSiteConfig()) {
+			$fromConfig = $modules->get('InputfieldMarkup');
+			$fromConfig->label = $this->_('Adobe credentials');
+			$fromConfig->attr('value', '<p>' . $sanitizer->entities($this->_('The Adobe client id and client secret are set in site/config.php.')) . '</p>');
+			$inputfields->add($fromConfig);
+		} else {
+			$id = $modules->get('InputfieldText');
+			$id->attr('name', 'clientId');
+			$id->label = $this->_('Adobe client id');
+			$id->description = $this->_('Used when $config->pdfAutoTagClientId is not set in site/config.php.');
+			$id->attr('value', (string) $this->clientId);
+			$inputfields->add($id);
+
+			$secret = $modules->get('InputfieldText');
+			$secret->attr('name', 'clientSecret');
+			$secret->attr('type', 'password');
+			$secret->label = $this->_('Adobe client secret');
+			$secret->description = $this->_('Used when $config->pdfAutoTagClientSecret is not set in site/config.php. Clearing this field removes the stored secret.');
+			$secret->attr('value', (string) $this->clientSecret);
+			$inputfields->add($secret);
+		}
+
+		$targets = $modules->get('InputfieldAsmSelect');
+		$targets->attr('name', 'watchedTargets');
+		$targets->label = $this->_('Watched file fields');
+		$targets->description = $this->_('File fields are watched on their templates and inside Repeater and Repeater Matrix items. Combo entries watch that file subfield, including when the Combo is inside a repeater.');
+		foreach($this->fields as $field) {
+			if(!$field->type) continue;
+			if($field->type instanceof FieldtypeFile && !$field->type instanceof FieldtypeImage) {
+				$targets->addOption('file:' . $field->id, $field->getLabel() . ' (' . $field->name . ')');
+			}
+		}
+		if($modules->isInstalled('FieldtypeCombo')) {
+			foreach($this->fields as $field) {
+				if(!wireInstanceOf($field->type, 'FieldtypeCombo')) continue;
+				$settings = $field->getComboSettings();
+				if(!$settings) continue;
+				foreach($settings->getSubfields() as $subfield) {
+					if(strtolower((string) $subfield->type) !== 'file') continue;
+					$subLabel = $subfield->get('label');
+					if(!$subLabel) $subLabel = $subfield->name;
+					$value = 'combo:' . $field->name . '.' . $subfield->name;
+					$targets->addOption($value, $field->getLabel() . ' / ' . $subLabel);
+				}
+			}
+		}
+		$targets->attr('value', $this->targetList());
+		$inputfields->add($targets);
+
+		$shift = $modules->get('InputfieldCheckbox');
+		$shift->attr('name', 'shiftHeadings');
+		$shift->label = $this->_('Shift headings');
+		$shift->description = $this->_('When a title is found, tag it as H1 and move other headings down one level. Applied to requested jobs. Default is off.');
+		if($this->shiftHeadings) $shift->attr('checked', 'checked');
+		$inputfields->add($shift);
+
+		$replace = $modules->get('InputfieldCheckbox');
+		$replace->attr('name', 'replaceOnComplete');
+		$replace->label = $this->_('Replace the field file when Adobe finishes');
+		$replace->description = $this->_('Off: keep the tagged PDF with the record until someone replaces the field file from the dashboard. On: after a requested job finishes, copy the current PDF aside and put the tagged PDF in the field. This does not send files to Adobe by itself.');
+		if($this->replaceOnComplete) $replace->attr('checked', 'checked');
+		$inputfields->add($replace);
+
+		$offerReport = $modules->get('InputfieldCheckbox');
+		$offerReport->attr('name', 'offerExcelReport');
+		$offerReport->label = $this->_('Offer the Excel report checkbox');
+		$offerReport->description = $this->_('When on, each watched PDF shows “Also generate the Excel report” after “Process with Adobe Auto-Tag” is checked. When off, that checkbox is not shown and saving the page cannot request a report.');
+		if($this->reportsOffered()) $offerReport->attr('checked', 'checked');
+		$inputfields->add($offerReport);
+
+		$reportDays = $modules->get('InputfieldInteger');
+		$reportDays->attr('name', 'reportRetentionDays');
+		$reportDays->label = $this->_('Excel report retention (days)');
+		$reportDays->description = $this->_('Global setting. 0 keeps every saved report until someone deletes it. A larger number deletes each saved report that many days after it was stored. The job row and tagged PDF stay.');
+		$reportDays->attr('min', 0);
+		$reportDays->attr('value', (int) $this->reportRetentionDays);
+		$inputfields->add($reportDays);
+
+		$backupDays = $modules->get('InputfieldInteger');
+		$backupDays->attr('name', 'backupRetentionDays');
+		$backupDays->label = $this->_('Replaced-original retention (days)');
+		$backupDays->description = $this->_('Global setting. Applies to original PDFs copied aside when automatic replace is on. 0 keeps those backups until someone restores them. A larger number deletes each of those backups that many days after the replace. Dashboard replace backups are kept.');
+		$backupDays->attr('min', 0);
+		$backupDays->attr('value', (int) $this->backupRetentionDays);
+		$inputfields->add($backupDays);
+
+		$mail = $modules->get('InputfieldCheckbox');
+		$mail->attr('name', 'notifyEmail');
+		$mail->label = $this->_('Email the requester when a job finishes or fails');
+		$mail->description = $this->_('The subject and body come from site/assets/pdf-autotag/email-template.php. Edit that file to change the message. It can use the ProcessWire API. Installation creates it, and an existing file is left as it is.');
+		if($this->notifyEmail) $mail->attr('checked', 'checked');
+		$inputfields->add($mail);
+
+		$callLimit = $modules->get('InputfieldInteger');
+		$callLimit->attr('name', 'monthlyCallLimit');
+		$callLimit->label = $this->_('Monthly Adobe API call limit');
+		$callLimit->description = $this->_('Maximum calls to the Adobe API in a calendar month. 500 is the free tier. Each API call counts toward this limit. When the limit is reached, or when too few calls remain to finish the next step for a PDF, that file stays queued and continues after the limit resets next month.');
+		$callLimit->attr('min', 0);
+		$callLimit->attr('value', $this->monthlyCallLimit());
+		$inputfields->add($callLimit);
+
+		return $inputfields;
+	}
+
+	protected function renderChoices($id, array $context, $row) {
+		$safeId = preg_replace('/[^A-Za-z0-9_]/', '', (string) $id);
+		$token = (int) $context['pages_id'] . '|' . (int) $context['field_id'] . '|'
+			. rawurlencode((string) $context['subfield']) . '|' . rawurlencode((string) $context['filename']);
+		$value = $this->wire('sanitizer')->entities($token);
+		if($this->replaceOnComplete) {
+			$help = 'When this job finishes, the PDF in this field is replaced by Adobe’s tagged file. The previous file is kept until replaced-original retention removes it.';
+		} else {
+			$help = 'The PDF in this field stays as it is. Adobe’s tagged file is kept for review until someone replaces the field file from the PDF Auto-Tag screen.';
+		}
+		$help .= ' Auto-tag rebuilds the tag structure and can make a document worse.';
+		$status = '';
+		if($row && $row['status'] === 0) $status = 'Auto-tag has been requested.';
+		else if($row && $row['status'] === 1) $status = 'Auto-tag previously completed. Check the box to request it again.';
+		else if($row && $row['status'] === 2) $status = 'The last auto-tag attempt failed. Check the box to request it again.';
+		$out = '<div class="pdf-autotag">';
+		$out .= '<p class="description">' . $this->wire('sanitizer')->entities($help) . '</p>';
+		if($status) $out .= '<p class="description">' . $this->wire('sanitizer')->entities($status) . '</p>';
+		$out .= '<label><input type="checkbox" class="pdf-autotag-request" name="pdf_autotag_' . $safeId . '" value="' . $value . '"';
+		if($this->reportsOffered()) {
+			$toggle = "var w=this.closest('.pdf-autotag');var r=w&&w.querySelector('.pdf-autotag-report');if(r){r.style.display=this.checked?'block':'none';if(!this.checked){var b=r.querySelector('input');if(b)b.checked=false;}}";
+			$out .= ' onchange="' . $toggle . '"';
+		}
+		$out .= '> ' . $this->_('Process with Adobe Auto-Tag') . '</label> ';
+		if($this->reportsOffered()) {
+			$out .= '<label class="pdf-autotag-report" style="display:none"><input type="checkbox" name="pdf_autotag_report_' . $safeId . '" value="' . $value . '"> '
+				. $this->_('Also generate the Excel report') . '</label>';
+		}
+		$out .= '</div>';
+		return $out;
+	}
+
+	protected function queueFromCheckbox($token, $savedPageId, $report) {
+		$parsed = $this->parseToken($token);
+		if(!$parsed || (int) $parsed['pages_id'] !== (int) $savedPageId) return;
+		if(!$this->isWatched($parsed['field_id'], $parsed['subfield'])) return;
+		$pagefile = $this->pagefileFromParts($parsed);
+		if(!$pagefile || strtolower($pagefile->ext()) !== 'pdf') return;
+		$parsed['filename'] = $pagefile->basename;
+		$identity = $this->identity($parsed['pages_id'], $parsed['field_id'], $parsed['subfield'], $parsed['filename']);
+		$row = $this->findByIdentity($identity);
+		if($row && (int) $row['skipped'] === 1) return;
+		$hash = @md5_file($pagefile->filename);
+		$now = time();
+		$userId = (int) $this->wire('user')->id;
+		list($ownerId, $containerId) = $this->ownerIds($pagefile->page);
+		if($row && $row['status'] === 0 && $row['job_location'] !== '') return;
+		if($row && $row['status'] === 0) {
+			$this->updateRow((int) $row['id'], array(
+				'generate_report' => $report ? 1 : 0,
+				'file_hash' => $hash ? $hash : '',
+				'user_id' => $userId,
+				'modified' => $now,
+				'owner_pages_id' => $ownerId,
+				'container_field_id' => $containerId,
+			));
+			return;
+		}
+		$data = array(
+			'status' => 0,
+			'skipped' => 0,
+			'generate_report' => $report ? 1 : 0,
+			'file_hash' => $hash ? $hash : '',
+			'user_id' => $userId,
+			'modified' => $now,
+			'job_location' => '',
+			'error' => '',
+			'owner_pages_id' => $ownerId,
+			'container_field_id' => $containerId,
+			'filename' => $parsed['filename'],
+		);
+		if($row) {
+			$this->updateRow((int) $row['id'], $data);
+			return;
+		}
+		$data['identity'] = $identity;
+		$data['pages_id'] = $parsed['pages_id'];
+		$data['field_id'] = $parsed['field_id'];
+		$data['subfield'] = $parsed['subfield'];
+		$data['created'] = $now;
+		$this->insertRow($data);
+	}
+
+	protected function processPending(array &$counts) {
+		$sql = 'SELECT * FROM pdf_autotag WHERE status = 0 ORDER BY modified ASC, id ASC';
+		$stmt = $this->database->prepare($sql);
+		$stmt->execute();
+		$rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+		$client = null;
+		$polls = 0;
+		foreach($rows as $row) {
+			$row = $this->normalize($row);
+			if($row['job_location'] === '') continue;
+			if($polls >= 4) break;
+			if(!$client) $client = $this->newClient();
+			if(!$this->canSpendApiCalls($client->callsToPoll())) {
+				$counts['deferred']++;
+				break;
+			}
+			$polls++;
+			$this->pollRow($row, $counts, $client);
+		}
+		$starts = 0;
+		foreach($rows as $row) {
+			$row = $this->normalize($row);
+			if($row['job_location'] !== '') continue;
+			if($starts >= 1) break;
+			if(!$client) $client = $this->newClient();
+			if(!$this->canSpendApiCalls($client->callsToStart())) {
+				$counts['deferred']++;
+				break;
+			}
+			$starts++;
+			$this->startRow($row, $counts, $client);
+		}
+	}
+
+	protected function startRow(array $row, array &$counts, &$client) {
+		$pagefile = $this->pagefileFromRow($row);
+		if(!$pagefile || !is_file($pagefile->filename)) {
+			$this->failRow($row, 'The PDF is no longer in the field.', $counts);
+			return;
+		}
+		$size = filesize($pagefile->filename);
+		if($size !== false && $size > self::MAX_BYTES) {
+			$this->failRow($row, 'The PDF is larger than 100 MB, which is the Adobe auto-tag limit.', $counts);
+			return;
+		}
+		try {
+			if(!$client) $client = $this->newClient();
+			$location = $client->startJob($pagefile->filename, (int) $row['generate_report'], (int) $this->shiftHeadings);
+			$this->updateRow((int) $row['id'], array(
+				'job_location' => $location,
+				'error' => '',
+				'modified' => time(),
+			));
+			$counts['started']++;
+		} catch(\Exception $e) {
+			if($this->pausedForQuota($e)) {
+				$counts['deferred']++;
+				return;
+			}
+			if($this->retryable($e)) {
+				$this->updateRow((int) $row['id'], array(
+					'error' => $e->getMessage(),
+					'modified' => time(),
+				));
+				$this->logError($e->getMessage());
+				return;
+			}
+			$this->failRow($row, $e->getMessage(), $counts);
+		}
+	}
+
+	protected function pollRow(array $row, array &$counts, &$client) {
+		try {
+			if(!$client) $client = $this->newClient();
+			$result = $client->poll($row['job_location']);
+		} catch(\Exception $e) {
+			if($this->pausedForQuota($e)) {
+				$counts['deferred']++;
+				return;
+			}
+			if($this->retryable($e)) {
+				$this->updateRow((int) $row['id'], array(
+					'error' => $e->getMessage(),
+					'modified' => time(),
+				));
+				return;
+			}
+			$this->failRow($row, $e->getMessage(), $counts);
+			return;
+		}
+		if(!empty($result['retry'])) {
+			$this->updateRow((int) $row['id'], array(
+				'error' => $result['error'],
+				'modified' => time(),
+			));
+			return;
+		}
+		if($result['status'] !== 'done') return;
+		try {
+			$dir = $this->rowDir((int) $row['id']);
+			$tagged = $dir . 'tagged.pdf';
+			if(is_file($tagged)) @unlink($tagged);
+			$client->download($result['taggedUrl'], $tagged);
+			$now = time();
+			$data = array(
+				'status' => 1,
+				'tagged_path' => $tagged,
+				'error' => '',
+				'modified' => $now,
+			);
+			if((int) $row['generate_report'] && $result['reportUrl'] !== '') {
+				$report = $dir . 'report.xlsx';
+				try {
+					if(is_file($report)) @unlink($report);
+					$client->download($result['reportUrl'], $report);
+					$data['report_path'] = $report;
+					$data['report_created'] = $now;
+				} catch(\Exception $e) {
+					if($this->pausedForQuota($e)) throw $e;
+					$data['note'] = 'Tagged PDF saved. The Excel report was not downloaded: ' . $e->getMessage();
+				}
+			}
+			$this->updateRow((int) $row['id'], $data);
+			$counts['finished']++;
+			$row = $this->findById((int) $row['id']);
+			if($this->replaceOnComplete && $row) {
+				try {
+					$this->replaceFieldFile((int) $row['id'], true);
+				} catch(\Exception $e) {
+					$this->updateRow((int) $row['id'], array(
+						'note' => 'Tagged PDF saved. Replacing the field file failed: ' . $e->getMessage(),
+					));
+				}
+				$row = $this->findById((int) $row['id']);
+			}
+			if($row) $this->notify($row, true);
+		} catch(\Exception $e) {
+			if($this->pausedForQuota($e)) {
+				$counts['deferred']++;
+				return;
+			}
+			$this->failRow($row, $e->getMessage(), $counts);
+		}
+	}
+
+	protected function failRow(array $row, $message, array &$counts) {
+		$this->updateRow((int) $row['id'], array(
+			'status' => 2,
+			'error' => $message,
+			'modified' => time(),
+		));
+		$counts['failed']++;
+		$row['status'] = 2;
+		$row['error'] = $message;
+		$this->notify($row, false);
+		$this->logError($message);
+	}
+
+	protected function applyRetention(array &$counts) {
+		$now = time();
+		$reportDays = (int) $this->reportRetentionDays;
+		if($reportDays > 0) {
+			$cutoff = $now - ($reportDays * 86400);
+			$sql = 'SELECT * FROM pdf_autotag WHERE report_created > 0 AND report_created < :cutoff AND report_path != ""';
+			$stmt = $this->database->prepare($sql);
+			$stmt->bindValue(':cutoff', $cutoff, \PDO::PARAM_INT);
+			$stmt->execute();
+			foreach($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+				$row = $this->normalize($row);
+				$this->removeStored($row['report_path']);
+				$this->updateRow((int) $row['id'], array(
+					'report_path' => '',
+					'report_created' => 0,
+					'note' => $this->appendNote($row['note'], 'Excel report removed by retention.'),
+				));
+				$counts['reportsRemoved']++;
+			}
+		}
+		$backupDays = (int) $this->backupRetentionDays;
+		if($backupDays > 0) {
+			$cutoff = $now - ($backupDays * 86400);
+			$sql = 'SELECT * FROM pdf_autotag WHERE backup_automatic = 1 AND backup_created > 0 AND backup_created < :cutoff AND backup_path != ""';
+			$stmt = $this->database->prepare($sql);
+			$stmt->bindValue(':cutoff', $cutoff, \PDO::PARAM_INT);
+			$stmt->execute();
+			foreach($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+				$row = $this->normalize($row);
+				$this->removeStored($row['backup_path']);
+				$this->updateRow((int) $row['id'], array(
+					'backup_path' => '',
+					'backup_created' => 0,
+					'note' => $this->appendNote($row['note'], 'Original backup removed by retention.'),
+				));
+				$counts['backupsRemoved']++;
+			}
+		}
+	}
+
+	protected function notify(array $row, $ok) {
+		if(!$this->notifyEmail) return;
+		$user = $this->wire('users')->get((int) $row['user_id']);
+		if(!$user || !$user->id || !$user->email) return;
+		$this->installEmailTemplate();
+		list($subject, $body) = $this->renderEmail($row, $ok, $user);
+		try {
+			$mail = wireMail();
+			$mail->to($user->email);
+			$mail->subject($subject);
+			$mail->body($body);
+			$mail->send();
+		} catch(\Exception $e) {
+			$this->logError($e->getMessage());
+		}
+	}
+
+	/**
+	 * Subject and body from site/assets/pdf-autotag/email-template.php.
+	 *
+	 * @param array $row
+	 * @param bool $ok
+	 * @param User $user
+	 * @return array
+	 */
+	protected function renderEmail(array $row, $ok, User $user) {
+		$filename = $row['filename'] !== '' ? $row['filename'] : 'PDF';
+		$status = $ok ? 'finished' : 'failed';
+		$message = $ok
+			? "Adobe finished auto-tagging $filename."
+			: "Adobe auto-tag did not finish $filename.";
+		$error = isset($row['error']) ? (string) $row['error'] : '';
+		$note = isset($row['note']) ? (string) $row['note'] : '';
+		$owner = $this->pages->get((int) $row['owner_pages_id']);
+		$ownerPage = ($owner && $owner->id) ? $owner : null;
+		$pageTitle = $ownerPage ? (string) $ownerPage->title : '';
+		$pageUrl = $ownerPage ? (string) $ownerPage->editUrl(true) : '';
+		$pageBlock = $pageTitle !== '' ? 'Page: ' . $pageTitle : '';
+		if($pageUrl !== '') $pageBlock = trim($pageBlock . "\n" . $pageUrl);
+		$screen = $this->pages->get('name=pdf-autotag, template=admin, include=all');
+		$dashboardUrl = ($screen && $screen->id) ? (string) $screen->httpUrl() : '';
+		$subject = '';
+		$body = '';
+		$returned = null;
+		$path = $this->readableEmailTemplate();
+		if($path) {
+			try {
+				ob_start();
+				$returned = include $path;
+				$echoed = ob_get_clean();
+			} catch(\Throwable $e) {
+				if(ob_get_level()) ob_end_clean();
+				$this->logError('Email template: ' . $e->getMessage());
+				$echoed = '';
+				$returned = null;
+				$subject = '';
+				$body = '';
+			}
+			if(is_array($returned)) {
+				if(isset($returned['subject'])) $subject = (string) $returned['subject'];
+				if(isset($returned['body'])) $body = (string) $returned['body'];
+			}
+			if($body === '' && is_string($echoed) && trim($echoed) !== '') $body = $echoed;
+		}
+		$subject = trim(preg_replace('/\s+/', ' ', (string) $subject));
+		$body = trim((string) $body);
+		if($subject === '') $subject = "PDF auto-tag $status: $filename";
+		if($body === '') $body = $message;
+		return array($subject, $body);
+	}
+
+	protected function emailTemplatePath() {
+		return $this->storagePath() . 'email-template.php';
+	}
+
+	/**
+	 * Absolute path of the template when it is a file inside the module storage directory.
+	 *
+	 * @return string
+	 */
+	protected function readableEmailTemplate() {
+		$path = $this->emailTemplatePath();
+		if(!is_file($path)) return '';
+		$root = realpath($this->storagePath());
+		$file = realpath($path);
+		if(!$root || !$file) return '';
+		$root = rtrim(str_replace('\\', '/', $root), '/') . '/';
+		$file = str_replace('\\', '/', $file);
+		if(strpos($file, $root) !== 0) return '';
+		return $file;
+	}
+
+	protected function defaultEmailTemplate() {
+		return "<?php namespace ProcessWire;\n"
+			. "\n"
+			. "/**\n"
+			. " * PDF Auto-Tag notification.\n"
+			. " *\n"
+			. " * Included when a requested job finishes or fails.\n"
+			. " * The ProcessWire API is available, including wire(), pages(), and \$config.\n"
+			. " * \$this is the PdfAutoTag module.\n"
+			. " *\n"
+			. " * \$ok            bool    true when Adobe finished\n"
+			. " * \$status        string  finished or failed\n"
+			. " * \$filename      string\n"
+			. " * \$message       string\n"
+			. " * \$error         string\n"
+			. " * \$note          string\n"
+			. " * \$ownerPage     Page|null\n"
+			. " * \$pageTitle     string\n"
+			. " * \$pageUrl       string  editor URL\n"
+			. " * \$pageBlock     string\n"
+			. " * \$dashboardUrl  string\n"
+			. " * \$user          User    requester\n"
+			. " * \$row           array   database row\n"
+			. " *\n"
+			. " * Set \$subject and \$body. A returned array('subject' => '', 'body' => '') is used instead.\n"
+			. " * This file is kept when the module is updated.\n"
+			. " */\n"
+			. "\n"
+			. "\$subject = \"PDF auto-tag \$status: \$filename\";\n"
+			. "\n"
+			. "\$body = \$message . \"\\n\\n\"\n"
+			. "\t. \$error . \"\\n\\n\"\n"
+			. "\t. \$note . \"\\n\\n\"\n"
+			. "\t. \$pageBlock . \"\\n\\n\"\n"
+			. "\t. \$dashboardUrl;\n"
+			. "\$body = trim(preg_replace(\"/\\n{3,}/\", \"\\n\\n\", \$body));\n";
+	}
+
+	/**
+	 * @return bool
+	 */
+	protected function reportsOffered() {
+		return (bool) $this->offerExcelReport;
+	}
+
+	protected function installEmailTemplate() {
+		$path = $this->emailTemplatePath();
+		if(is_file($path)) return;
+		$this->wire('files')->filePutContents($path, $this->defaultEmailTemplate());
+	}
+
+	protected function newClient() {
+		$client = new AdobeAutoTagClient($this->credential('id'), $this->credential('secret'));
+		$client->setUsage($this);
+		$this->wire($client);
+		$client->restoreToken();
+		return $client;
+	}
+
+	/**
+	 * True when a saved Adobe access token can still be reused.
+	 *
+	 * @return bool
+	 */
+	public function hasSavedToken() {
+		return $this->newClient()->hasToken();
+	}
+
+	/**
+	 * Calls already made to the Adobe API in the current calendar month.
+	 *
+	 * @return int
+	 */
+	public function monthlyCallCount() {
+		$this->installUsageTable();
+		if(!$this->database->tableExists('pdf_autotag_usage')) return 0;
+		$stmt = $this->database->prepare('SELECT calls FROM pdf_autotag_usage WHERE period = :period');
+		$stmt->bindValue(':period', $this->usagePeriod());
+		$stmt->execute();
+		$value = $stmt->fetchColumn();
+		return $value === false ? 0 : (int) $value;
+	}
+
+	/**
+	 * Configured maximum Adobe API calls for one calendar month.
+	 *
+	 * @return int
+	 */
+	public function monthlyCallLimit() {
+		$limit = (int) $this->get('monthlyCallLimit');
+		return $limit < 0 ? 0 : $limit;
+	}
+
+	/**
+	 * True when $needed more Adobe API calls still fit in this month's limit.
+	 *
+	 * @param int $needed
+	 * @return bool
+	 */
+	public function canSpendApiCalls($needed) {
+		$needed = (int) $needed;
+		if($needed < 1) return true;
+		return ($this->monthlyCallCount() + $needed) <= $this->monthlyCallLimit();
+	}
+
+	/**
+	 * Count one Adobe API call against the current month.
+	 */
+	public function recordApiCall() {
+		$this->installUsageTable();
+		$sql = 'INSERT INTO pdf_autotag_usage (period, calls) VALUES (:period, 1) '
+			. 'ON DUPLICATE KEY UPDATE calls = calls + 1';
+		$stmt = $this->database->prepare($sql);
+		$stmt->bindValue(':period', $this->usagePeriod());
+		$stmt->execute();
+	}
+
+	protected function usagePeriod() {
+		return date('Y-m');
+	}
+
+	protected function pausedForQuota(\Exception $e) {
+		return (int) $e->getCode() === 402;
+	}
+
+	protected function retryable(\Exception $e) {
+		$code = (int) $e->getCode();
+		if($code === 429 || $code === 401) return true;
+		$message = strtolower($e->getMessage());
+		return strpos($message, '429') !== false || strpos($message, 'rate limit') !== false;
+	}
+
+	protected function watchContext(InputfieldFile $inputfield, Pagefile $pagefile) {
+		$page = $pagefile->page;
+		if(!$page || !$page->id) return null;
+		if(strtolower($pagefile->ext()) !== 'pdf') return null;
+		$subfield = (string) $inputfield->wrapAttr('data-combo-name');
+		if($subfield !== '') {
+			$comboField = $this->comboField($inputfield);
+			if(!$comboField || !$comboField->id) return null;
+			if(!$this->isWatched((int) $comboField->id, $subfield)) return null;
+			$fieldId = (int) $comboField->id;
+		} else {
+			$field = $inputfield->hasField;
+			if(!$field || !$field->id) return null;
+			if(!$this->isWatched((int) $field->id, '')) return null;
+			$fieldId = (int) $field->id;
+			$subfield = '';
+		}
+		list($ownerId, $containerId) = $this->ownerIds($page);
+		return array(
+			'pages_id' => (int) $page->id,
+			'owner_pages_id' => $ownerId,
+			'field_id' => $fieldId,
+			'container_field_id' => $containerId,
+			'subfield' => $subfield,
+			'filename' => $pagefile->basename,
+		);
+	}
+
+	protected function comboField(Inputfield $inputfield) {
+		$parent = $inputfield->getParent();
+		while($parent) {
+			if(wireInstanceOf($parent, 'InputfieldCombo')) {
+				if($parent->hasField && $parent->hasField->id) return $parent->hasField;
+				$name = preg_replace('/_repeater\d+$/', '', (string) $parent->attr('name'));
+				$field = $this->fields->get($name);
+				if($field && $field->id) return $field;
+			}
+			$parent = $parent->getParent();
+		}
+		return null;
+	}
+
+	protected function isWatched($fieldId, $subfield) {
+		$field = $this->fields->get((int) $fieldId);
+		if(!$field || !$field->id) return false;
+		if($subfield === '') return in_array('file:' . (int) $field->id, $this->targetList(), true);
+		return in_array('combo:' . $field->name . '.' . $subfield, $this->targetList(), true);
+	}
+
+	protected function targetList() {
+		$targets = $this->watchedTargets;
+		if(!$targets) return array();
+		if(!is_array($targets)) $targets = array($targets);
+		$clean = array();
+		foreach($targets as $target) {
+			$target = (string) $target;
+			if($target !== '') $clean[] = $target;
+		}
+		return $clean;
+	}
+
+	protected function ownerIds(Page $page) {
+		$ownerId = (int) $page->id;
+		$containerId = 0;
+		if(method_exists($page, 'getForPageRoot')) {
+			$owner = $page->getForPageRoot();
+			$container = $page->getForFieldRoot();
+			if($owner && $owner->id) $ownerId = (int) $owner->id;
+			if($container && $container->id) $containerId = (int) $container->id;
+		}
+		return array($ownerId, $containerId);
+	}
+
+	protected function collectFileField($fieldId, array $byIdentity, array &$found, array &$seen) {
+		$field = $this->fields->get((int) $fieldId);
+		if(!$field || !$field->id) return;
+		$selector = $field->name . '.count>0, include=all, check_access=0';
+		foreach($this->pages->find($selector) as $page) {
+			$page->of(false);
+			$files = $page->get($field->name);
+			if(!$files instanceof Pagefiles) continue;
+			foreach($files as $pagefile) {
+				if(strtolower($pagefile->ext()) !== 'pdf') continue;
+				$this->pushEntry($page, (int) $field->id, '', $pagefile, $byIdentity, $found, $seen);
+			}
+		}
+	}
+
+	protected function collectCombo($spec, array $byIdentity, array &$found, array &$seen) {
+		$parts = explode('.', $spec, 2);
+		if(count($parts) < 2) return;
+		$field = $this->fields->get($parts[0]);
+		$subfield = $parts[1];
+		if(!$field || !$field->id || $subfield === '') return;
+		$templateIds = array();
+		foreach($field->getTemplates() as $template) {
+			if($template && $template->id) $templateIds[] = (int) $template->id;
+		}
+		if(!count($templateIds)) return;
+		$selector = 'template=' . implode('|', $templateIds) . ', include=all, check_access=0';
+		foreach($this->pages->find($selector) as $page) {
+			$page->of(false);
+			$combo = $page->get($field->name);
+			if(!is_object($combo) || !method_exists($combo, 'get')) continue;
+			$files = $combo->get($subfield);
+			$list = array();
+			if($files instanceof Pagefiles) $list = $files;
+			else if($files instanceof Pagefile) $list = array($files);
+			foreach($list as $pagefile) {
+				if(strtolower($pagefile->ext()) !== 'pdf') continue;
+				$this->pushEntry($page, (int) $field->id, $subfield, $pagefile, $byIdentity, $found, $seen);
+			}
+		}
+	}
+
+	protected function pushEntry(Page $page, $fieldId, $subfield, Pagefile $pagefile, array $byIdentity, array &$found, array &$seen) {
+		$filename = $pagefile->basename;
+		$identity = $this->identity((int) $page->id, (int) $fieldId, $subfield, $filename);
+		list($ownerId, $containerId) = $this->ownerIds($page);
+		$row = isset($byIdentity[$identity]) ? $byIdentity[$identity] : null;
+		$seen[$identity] = true;
+		$found[] = array(
+			'pagefile' => $pagefile,
+			'pages_id' => (int) $page->id,
+			'owner_pages_id' => $ownerId,
+			'field_id' => (int) $fieldId,
+			'container_field_id' => $containerId,
+			'subfield' => (string) $subfield,
+			'filename' => $filename,
+			'row' => $row,
+			'missing' => false,
+		);
+	}
+
+	protected function pagefileFromParts(array $parsed) {
+		return $this->pagefileFromRow(array(
+			'pages_id' => $parsed['pages_id'],
+			'field_id' => $parsed['field_id'],
+			'subfield' => $parsed['subfield'],
+			'filename' => $parsed['filename'],
+		));
+	}
+
+	protected function pagefileFromRow(array $row) {
+		$files = $this->pagefilesFromRow($row);
+		if(!$files) return null;
+		foreach($files as $file) {
+			if($file->basename === $row['filename']) return $file;
+		}
+		return null;
+	}
+
+	protected function pagefilesFromRow(array $row) {
+		$page = $this->pages->get((int) $row['pages_id']);
+		if(!$page || !$page->id) return null;
+		$page->of(false);
+		$field = $this->fields->get((int) $row['field_id']);
+		if(!$field || !$field->id) return null;
+		if($row['subfield'] === '' || $row['subfield'] === null) {
+			$value = $page->get($field->name);
+			return $value instanceof Pagefiles ? $value : null;
+		}
+		$combo = $page->get($field->name);
+		if(!is_object($combo) || !method_exists($combo, 'get')) return null;
+		$value = $combo->get($row['subfield']);
+		if($value instanceof Pagefile) return $value->pagefiles;
+		return $value instanceof Pagefiles ? $value : null;
+	}
+
+	protected function backupOriginal(array $row, Pagefile $pagefile, $automatic) {
+		if($this->storedFile($row['backup_path'])) return;
+		$dir = $this->rowDir((int) $row['id']);
+		$dest = $dir . 'original.pdf';
+		if(!@copy($pagefile->filename, $dest)) {
+			throw new WireException('The original PDF could not be backed up.');
+		}
+		$this->wire('files')->chmod($dest);
+		$now = time();
+		$this->updateRow((int) $row['id'], array(
+			'backup_path' => $dest,
+			'backup_created' => $now,
+			'backup_automatic' => $automatic ? 1 : 0,
+			'modified' => $now,
+		));
+	}
+
+	protected function addFileToField(array $row, $source) {
+		$files = $this->pagefilesFromRow($row);
+		$page = $this->pages->get((int) $row['pages_id']);
+		$field = $this->fields->get((int) $row['field_id']);
+		if(!$files || !$page->id || !$field || !$field->id) {
+			throw new WireException('The field is no longer available for restore.');
+		}
+		$dir = $this->rowDir((int) $row['id']);
+		$copy = $dir . $row['filename'];
+		if(!@copy($source, $copy)) throw new WireException('The original PDF could not be prepared for restore.');
+		$page->of(false);
+		$files->add($copy);
+		$page->save($field->name);
+		if(is_file($copy) && realpath($copy) !== realpath($source)) @unlink($copy);
+	}
+
+	protected function touchField(array $row) {
+		$page = $this->pages->get((int) $row['pages_id']);
+		$field = $this->fields->get((int) $row['field_id']);
+		if(!$page || !$page->id || !$field || !$field->id) return;
+		$page->of(false);
+		$page->trackChange($field->name);
+		$page->save($field->name);
+	}
+
+	protected function parseToken($token) {
+		$parts = explode('|', (string) $token, 4);
+		if(count($parts) < 4) return null;
+		$filename = basename(rawurldecode($parts[3]));
+		if($filename === '' || $filename === '.' || $filename === '..') return null;
+		return array(
+			'pages_id' => (int) $parts[0],
+			'field_id' => (int) $parts[1],
+			'subfield' => rawurldecode($parts[2]),
+			'filename' => $filename,
+		);
+	}
+
+	protected function identity($pagesId, $fieldId, $subfield, $filename) {
+		return sha1((int) $pagesId . "\0" . (int) $fieldId . "\0" . (string) $subfield . "\0" . (string) $filename);
+	}
+
+	protected function installTable() {
+		$engine = $this->config->dbEngine ? $this->config->dbEngine : 'InnoDB';
+		$charset = $this->config->dbCharset ? $this->config->dbCharset : 'utf8mb4';
+		if(!preg_match('/^[A-Za-z0-9_]+$/', $engine)) $engine = 'InnoDB';
+		if(!preg_match('/^[A-Za-z0-9_]+$/', $charset)) $charset = 'utf8mb4';
+		$sql = "CREATE TABLE IF NOT EXISTS pdf_autotag (
+			id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+			`identity` CHAR(40) NOT NULL,
+			pages_id INT UNSIGNED NOT NULL,
+			owner_pages_id INT UNSIGNED NOT NULL DEFAULT 0,
+			field_id INT UNSIGNED NOT NULL,
+			container_field_id INT UNSIGNED NOT NULL DEFAULT 0,
+			subfield VARCHAR(128) NOT NULL DEFAULT '',
+			filename VARCHAR(255) NOT NULL DEFAULT '',
+			file_hash CHAR(32) NOT NULL DEFAULT '',
+			status TINYINT NULL DEFAULT NULL,
+			skipped TINYINT UNSIGNED NOT NULL DEFAULT 0,
+			generate_report TINYINT UNSIGNED NOT NULL DEFAULT 0,
+			created INT UNSIGNED NOT NULL DEFAULT 0,
+			modified INT UNSIGNED NOT NULL DEFAULT 0,
+			user_id INT UNSIGNED NOT NULL DEFAULT 0,
+			job_location VARCHAR(512) NOT NULL DEFAULT '',
+			error TEXT NULL,
+			note TEXT NULL,
+			tagged_path VARCHAR(512) NOT NULL DEFAULT '',
+			report_path VARCHAR(512) NOT NULL DEFAULT '',
+			backup_path VARCHAR(512) NOT NULL DEFAULT '',
+			report_created INT UNSIGNED NOT NULL DEFAULT 0,
+			backup_created INT UNSIGNED NOT NULL DEFAULT 0,
+			backup_automatic TINYINT UNSIGNED NOT NULL DEFAULT 0,
+			PRIMARY KEY (id),
+			UNIQUE KEY pdf_autotag_identity (`identity`),
+			KEY status_modified (status, modified)
+		) ENGINE=$engine DEFAULT CHARSET=$charset";
+		$this->database->exec($sql);
+		$this->installUsageTable();
+	}
+
+	protected function installUsageTable() {
+		if($this->database->tableExists('pdf_autotag_usage')) return;
+		$engine = $this->config->dbEngine ? $this->config->dbEngine : 'InnoDB';
+		$charset = $this->config->dbCharset ? $this->config->dbCharset : 'utf8mb4';
+		if(!preg_match('/^[A-Za-z0-9_]+$/', $engine)) $engine = 'InnoDB';
+		if(!preg_match('/^[A-Za-z0-9_]+$/', $charset)) $charset = 'utf8mb4';
+		$sql = "CREATE TABLE IF NOT EXISTS pdf_autotag_usage (
+			period CHAR(7) NOT NULL,
+			calls INT UNSIGNED NOT NULL DEFAULT 0,
+			PRIMARY KEY (period)
+		) ENGINE=$engine DEFAULT CHARSET=$charset";
+		$this->database->exec($sql);
+	}
+
+	protected function installStorage() {
+		$dir = $this->storagePath();
+		$file = $dir . '.htaccess';
+		if(is_file($file)) return;
+		$rules = "<IfModule mod_authz_core.c>\n\tRequire all denied\n</IfModule>\n"
+			. "<IfModule !mod_authz_core.c>\n\tDeny from all\n</IfModule>\n";
+		$this->wire('files')->filePutContents($file, $rules);
+	}
+
+	protected function installPermission() {
+		$permission = $this->permissions->get('pdf-autotag');
+		if($permission && $permission->id) return;
+		$permission = $this->permissions->add('pdf-autotag');
+		if(!$permission || !$permission->id) return;
+		$permission->title = 'Request and review Adobe PDF auto-tagging';
+		$permission->save();
+	}
+
+	public function storagePath() {
+		$path = $this->wire('config')->paths->assets . 'pdf-autotag/';
+		if(!is_dir($path)) wireMkdir($path);
+		return $path;
+	}
+
+	protected function rowDir($id) {
+		$dir = $this->storagePath() . (int) $id . '/';
+		if(!is_dir($dir)) wireMkdir($dir);
+		return $dir;
+	}
+
+	protected function lockQueue() {
+		$path = $this->storagePath() . 'queue.lock';
+		$fp = @fopen($path, 'c');
+		if(!$fp) return null;
+		if(!flock($fp, LOCK_EX | LOCK_NB)) {
+			fclose($fp);
+			return false;
+		}
+		return $fp;
+	}
+
+	protected function tableExists() {
+		return $this->database->tableExists('pdf_autotag');
+	}
+
+	protected function allRows() {
+		if(!$this->tableExists()) return array();
+		$stmt = $this->database->prepare('SELECT * FROM pdf_autotag');
+		$stmt->execute();
+		$rows = array();
+		foreach($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+			$rows[] = $this->normalize($row);
+		}
+		return $rows;
+	}
+
+	protected function findById($id) {
+		if(!$this->tableExists()) return null;
+		$stmt = $this->database->prepare('SELECT * FROM pdf_autotag WHERE id = :id');
+		$stmt->bindValue(':id', (int) $id, \PDO::PARAM_INT);
+		$stmt->execute();
+		$row = $stmt->fetch(\PDO::FETCH_ASSOC);
+		return $row ? $this->normalize($row) : null;
+	}
+
+	protected function findByIdentity($identity) {
+		if(!$this->tableExists()) return null;
+		$stmt = $this->database->prepare('SELECT * FROM pdf_autotag WHERE `identity` = :identity');
+		$stmt->bindValue(':identity', $identity);
+		$stmt->execute();
+		$row = $stmt->fetch(\PDO::FETCH_ASSOC);
+		return $row ? $this->normalize($row) : null;
+	}
+
+	protected function normalize($row) {
+		if(!$row) return null;
+		if(!array_key_exists('status', $row) || $row['status'] === null || $row['status'] === '') {
+			$row['status'] = null;
+		} else {
+			$row['status'] = (int) $row['status'];
+		}
+		foreach(array('subfield', 'filename', 'file_hash', 'job_location', 'error', 'note', 'tagged_path', 'report_path', 'backup_path') as $key) {
+			if(!isset($row[$key]) || $row[$key] === null) $row[$key] = '';
+		}
+		return $row;
+	}
+
+	protected function insertRow(array $data) {
+		$columns = array(
+			'identity', 'pages_id', 'owner_pages_id', 'field_id', 'container_field_id', 'subfield', 'filename',
+			'file_hash', 'status', 'skipped', 'generate_report', 'created', 'modified', 'user_id', 'job_location',
+			'error', 'note', 'tagged_path', 'report_path', 'backup_path', 'report_created', 'backup_created', 'backup_automatic',
+		);
+		$defaults = array(
+			'owner_pages_id' => 0,
+			'container_field_id' => 0,
+			'subfield' => '',
+			'filename' => '',
+			'file_hash' => '',
+			'status' => null,
+			'skipped' => 0,
+			'generate_report' => 0,
+			'created' => time(),
+			'modified' => time(),
+			'user_id' => 0,
+			'job_location' => '',
+			'error' => '',
+			'note' => '',
+			'tagged_path' => '',
+			'report_path' => '',
+			'backup_path' => '',
+			'report_created' => 0,
+			'backup_created' => 0,
+			'backup_automatic' => 0,
+		);
+		$data = array_merge($defaults, $data);
+		$names = array();
+		$marks = array();
+		foreach($columns as $column) {
+			$names[] = '`' . $column . '`';
+			$marks[] = ':' . $column;
+		}
+		$sql = 'INSERT INTO pdf_autotag (' . implode(', ', $names) . ') VALUES (' . implode(', ', $marks) . ')';
+		$stmt = $this->database->prepare($sql);
+		foreach($columns as $column) {
+			$this->bindColumn($stmt, $column, $data[$column]);
+		}
+		$stmt->execute();
+		return (int) $this->database->lastInsertId();
+	}
+
+	protected function updateRow($id, array $data) {
+		$allowed = array(
+			'owner_pages_id', 'container_field_id', 'subfield', 'filename', 'file_hash', 'status', 'skipped',
+			'generate_report', 'modified', 'user_id', 'job_location', 'error', 'note', 'tagged_path', 'report_path',
+			'backup_path', 'report_created', 'backup_created', 'backup_automatic',
+		);
+		$sets = array();
+		$values = array();
+		foreach($data as $column => $value) {
+			if(!in_array($column, $allowed, true)) continue;
+			$sets[] = '`' . $column . '` = :' . $column;
+			$values[$column] = $value;
+		}
+		if(!count($sets)) return;
+		$sql = 'UPDATE pdf_autotag SET ' . implode(', ', $sets) . ' WHERE id = :id';
+		$stmt = $this->database->prepare($sql);
+		foreach($values as $column => $value) {
+			$this->bindColumn($stmt, $column, $value);
+		}
+		$stmt->bindValue(':id', (int) $id, \PDO::PARAM_INT);
+		$stmt->execute();
+	}
+
+	protected function bindColumn(\PDOStatement $stmt, $column, $value) {
+		if($column === 'status' && $value === null) {
+			$stmt->bindValue(':' . $column, null, \PDO::PARAM_NULL);
+			return;
+		}
+		if(is_int($value)) {
+			$stmt->bindValue(':' . $column, $value, \PDO::PARAM_INT);
+			return;
+		}
+		$stmt->bindValue(':' . $column, $value === null ? '' : (string) $value);
+	}
+
+	protected function removeStored($path) {
+		if(!$this->storedFile($path)) return;
+		@unlink($path);
+	}
+
+	protected function appendNote($existing, $addition) {
+		$existing = trim((string) $existing);
+		if($existing === '') return $addition;
+		if(strpos($existing, $addition) !== false) return $existing;
+		return $existing . ' ' . $addition;
+	}
+
+	protected function logError($message) {
+		$this->wire('log')->save('pdf-autotag', $message);
+	}
+}

@@ -1,0 +1,16 @@
+.pdf-autotag label {
+	margin: 0.35em 0;
+}
+
+a.pdf-autotag-action {
+	margin: 0.25em;
+	white-space: nowrap;
+	min-height:24px;
+	min-width:24px;
+	display:inline-block;
+	text-align:center;
+}
+
+table.AdminDataList td.actions {
+	/* text-wrap: nowrap; */
+}
