@@ -9,7 +9,7 @@ class ProcessPdfAutoTag extends Process implements Module {
 		return array(
 			'title' => 'PDF Auto-Tag',
 			'summary' => 'PDFs in watched fields, whether auto-tag was requested, and the state of each job.',
-			'version' => '0.1.0',
+			'version' => '0.1.1',
 			'author' => 'pwstaff',
 			'permission' => 'pdf-autotag',
 			'permissions' => array(
