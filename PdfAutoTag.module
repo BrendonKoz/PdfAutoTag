@@ -102,7 +102,7 @@ class PdfAutoTag extends WireData implements Module, ConfigurableModule {
 		$nonce = $this->get_nonce('pdf-autotag');
 		$adminTheme = $this->wire('adminTheme');
 		$adminTheme->addExtraMarkup('head', "<link{$nonce} rel='stylesheet' href='{$url}pdf-autotag.css?v=3'>");
-		$adminTheme->addExtraMarkup('head', "<script{$nonce} type='module' src='{$url}pdf-autotag.js?v=2'></script$>");
+		$adminTheme->addExtraMarkup('head', "<script{$nonce} type='module' src='{$url}pdf-autotag.js?v=2'></script>");
 	}
 
     /**
